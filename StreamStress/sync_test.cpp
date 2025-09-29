@@ -58,7 +58,7 @@ int main() {
 
     std::cout << "Found " << nDevices << " GPU devices, but we only used " << usedDevices << " GPUs\n";
 
-    int streamsPerDevice = 4;
+    int streamsPerDevice = 6;
     std::vector<PerDeviceData> devices(streamsPerDevice);
 
     for (int d = 0; d < usedDevices; d++) {
@@ -135,7 +135,7 @@ int main() {
         }
 
         std::cout << "Iteration " << iter++
-                  << " done, devices=" << devices.size()
+                  << " done, devices=" << usedDevices
                   << ", StreamsPerDevice=" << streamsPerDevice
                   << ", hipMemcpyHtoDAsync() + hipLaunchKernelGGL() + hipMemcpyDtoHAsync() + hipDeviceSynchronize()" 
                   << std::endl;
