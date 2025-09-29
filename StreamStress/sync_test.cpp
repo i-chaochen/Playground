@@ -1,176 +1,147 @@
 // hipcc -std=c++17 sync_test.cpp -o sync_test -lpthread
 #include <hip/hip_runtime.h>
 #include <iostream>
-#include <vector>
 #include <thread>
+#include <vector>
 #include <atomic>
-#include <cstring>
-#include <csignal>
-#include <pthread.h>
+#include <chrono>
+#include <cstdlib>
 
-#define HIP_CHECK(call)                                                        \
-    do {                                                                       \
-        hipError_t err = call;                                                 \
-        if (err != hipSuccess) {                                               \
-            std::cerr << "HIP error at " << __FILE__ << ":" << __LINE__       \
-                      << " code=" << err << " (" << hipGetErrorString(err)    \
-                      << ")\n";                                                \
-            std::exit(EXIT_FAILURE);                                           \
-        }                                                                      \
+#define HIP_CHECK(cmd)                                                   \
+    do {                                                                 \
+        hipError_t e = cmd;                                              \
+        if (e != hipSuccess) {                                           \
+            std::cerr << "HIP error: " << hipGetErrorString(e)           \
+                      << " at " << __FILE__ << ":" << __LINE__ << "\n";  \
+            std::exit(EXIT_FAILURE);                                     \
+        }                                                                \
     } while (0)
 
-static std::atomic<bool> g_stop{false};
-
-void sigint_handler(int) {
-    g_stop.store(true);
-}
-
-// Pin a std::thread to a specific CPU core (Linux only, best-effort)
-void set_thread_affinity(std::thread &t, unsigned core_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    pthread_t handle = t.native_handle();
-    pthread_setaffinity_np(handle, sizeof(cpu_set_t), &cpuset);
-}
-
-// Simple device kernel
-__global__ void add_kernel(float *d_out, const float *d_in, float v, size_t n) {
+// Dummy kernel: just increments values
+__global__ void testKernel(float* data, size_t N) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) d_out[idx] = d_in[idx] + v;
+    if (idx < N) data[idx] += 1.0f;
 }
+
+struct PerDeviceData {
+    int deviceId;
+    hipDeviceProp_t props;
+    std::vector<hipStream_t> streams;
+    std::vector<void*> d_inputs;
+    std::vector<void*> d_outputs;
+    std::vector<void*> h_pinned_src;
+    std::vector<void*> h_pinned_dst;
+    size_t bufBytes = 0;
+};
 
 int main() {
-    std::signal(SIGINT, sigint_handler);
+    // === Thread pool to claim all CPU cores ===
+    unsigned nThreads = std::thread::hardware_concurrency();
+    std::atomic<bool> keepRunning{true};
+    std::vector<std::thread> cpuThreads;
+    cpuThreads.reserve(nThreads);
 
-    unsigned hw_threads = std::thread::hardware_concurrency();
-    if (hw_threads == 0) hw_threads = 1;
-    std::cout << "Detected hardware_concurrency(): " << hw_threads << " threads\n";
-
-    // Launch CPU worker threads
-    std::vector<std::thread> workers;
-    std::atomic<size_t> copy_ops{0};
-
-    for (unsigned i = 0; i < hw_threads; ++i) {
-        workers.emplace_back([i, &copy_ops]() {
-            const size_t BUF_BYTES = 4 * 1024 * 1024; // 4 MB
-            std::vector<char> a(BUF_BYTES), b(BUF_BYTES);
-            std::memset(a.data(), (int)i, BUF_BYTES);
-            while (!g_stop.load()) {
-                std::memcpy(b.data(), a.data(), BUF_BYTES);
-                volatile char c = b[0]; (void)c;
-                ++copy_ops;
+    for (unsigned i = 0; i < nThreads; i++) {
+        cpuThreads.emplace_back([&keepRunning]() {
+            std::vector<char> buffer(1024 * 1024, 42); // 1MB per thread
+            while (keepRunning) {
+                // Simulate host-only copy
+                std::vector<char> temp(buffer);
+                temp[0] = buffer[0];
             }
         });
-        set_thread_affinity(workers.back(), i);
     }
 
-    // --- GPU setup ---
-    int deviceCount = 0;
-    HIP_CHECK(hipGetDeviceCount(&deviceCount));
-    std::cout << "hipGetDeviceCount() = " << deviceCount << "\n";
+    // === Query devices ===
+    int nDevices = 0;
+    HIP_CHECK(hipGetDeviceCount(&nDevices));
+    std::cout << "Found " << nDevices << " GPU devices, but we only used 4 GPUs\n";
 
-    int useDevices = std::min(deviceCount, 4);
-    if (useDevices <= 0) {
-        std::cerr << "No HIP devices found.\n";
-        g_stop.store(true);
-    }
+    int streamsPerDevice = 4;
+    std::vector<PerDeviceData> devices(streamsPerDevice);
 
-    struct PerDevice {
-        int devId;
-        hipDeviceProp_t props;
-        std::vector<hipStream_t> streams;
-        std::vector<void*> d_inputs;
-        std::vector<void*> d_outputs;
-        std::vector<void*> h_pinned_src;
-        std::vector<void*> h_pinned_dst;
-    };
-    std::vector<PerDevice> devices;
-
-    const size_t ELEMENTS = 1 << 20; // 1M floats (~4MB)
-    const size_t BYTES = ELEMENTS * sizeof(float);
-    const int streamsPerDevice = 4;
-
-    for (int d = 0; d < useDevices; ++d) {
-        PerDevice pd;
-        pd.devId = d;
-        HIP_CHECK(hipGetDeviceProperties(&pd.props, d));
-        std::cout << "Device " << d << ": " << pd.props.name << "\n";
-
+    for (int d = 0; d < 4; d++) {
         HIP_CHECK(hipSetDevice(d));
+        devices[d].deviceId = d;
 
-        pd.streams.resize(streamsPerDevice);
-        pd.d_inputs.resize(streamsPerDevice);
-        pd.d_outputs.resize(streamsPerDevice);
-        pd.h_pinned_src.resize(streamsPerDevice);
-        pd.h_pinned_dst.resize(streamsPerDevice);
+        HIP_CHECK(hipGetDeviceProperties(&devices[d].props, d));
+        std::cout << "GPU " << d << ": " << devices[d].props.name << "\n";
+
+        // Query free memory
+        size_t freeMem = 0, totalMem = 0;
+        HIP_CHECK(hipMemGetInfo(&freeMem, &totalMem));
+        freeMem = freeMem * 0.4;
+
+        size_t allocSize = freeMem > (64ULL << 20) ? freeMem - (64ULL << 20) : freeMem / 2;
+        devices[d].bufBytes = allocSize / (2 * streamsPerDevice);
+
+        std::cout << "  Total=" << (totalMem >> 20) << " MB, Free="
+                  << (freeMem >> 20) << " MB, Allocating ~"
+                  << (allocSize >> 20) << " MB across " << streamsPerDevice
+                  << " streams\n";
+
+        // Allocate per stream
+        devices[d].streams.resize(streamsPerDevice);
+        devices[d].d_inputs.resize(streamsPerDevice);
+        devices[d].d_outputs.resize(streamsPerDevice);
+        devices[d].h_pinned_src.resize(streamsPerDevice);
+        devices[d].h_pinned_dst.resize(streamsPerDevice);
 
         for (int s = 0; s < streamsPerDevice; ++s) {
-            HIP_CHECK(hipStreamCreateWithFlags(&pd.streams[s], hipStreamNonBlocking));
-            HIP_CHECK(hipMalloc(&pd.d_inputs[s], BYTES));
-            HIP_CHECK(hipMalloc(&pd.d_outputs[s], BYTES));
-            HIP_CHECK(hipHostMalloc(&pd.h_pinned_src[s], BYTES, hipHostMallocDefault));
-            HIP_CHECK(hipHostMalloc(&pd.h_pinned_dst[s], BYTES, hipHostMallocDefault));
+            HIP_CHECK(hipStreamCreateWithFlags(&devices[d].streams[s], hipStreamNonBlocking));
+            HIP_CHECK(hipMalloc(&devices[d].d_inputs[s], devices[d].bufBytes));
+            HIP_CHECK(hipMalloc(&devices[d].d_outputs[s], devices[d].bufBytes));
+            HIP_CHECK(hipHostMalloc(&devices[d].h_pinned_src[s], devices[d].bufBytes, hipHostMallocDefault));
+            HIP_CHECK(hipHostMalloc(&devices[d].h_pinned_dst[s], devices[d].bufBytes, hipHostMallocDefault));
 
-            float *hsrc = static_cast<float*>(pd.h_pinned_src[s]);
-            for (size_t i = 0; i < ELEMENTS; ++i) hsrc[i] = static_cast<float>(i % 1024);
+            // Fill pinned buffer
+            float* hsrc = static_cast<float*>(devices[d].h_pinned_src[s]);
+            size_t numFloats = devices[d].bufBytes / sizeof(float);
+            for (size_t i = 0; i < numFloats; ++i) hsrc[i] = static_cast<float>(i % 1024);
         }
-        devices.push_back(std::move(pd));
     }
 
-    std::cout << "Running... press Ctrl+C to stop.\n";
-    size_t iteration = 0;
+    // === Main infinite loop ===
+    size_t iter = 0;
+    while (true) {
+        for (int d = 0; d < nDevices; d++) {
+            HIP_CHECK(hipSetDevice(devices[d].deviceId));
 
-    while (!g_stop.load()) {
-        for (auto &pd : devices) {
-            HIP_CHECK(hipSetDevice(pd.devId));
-            for (size_t s = 0; s < pd.streams.size(); ++s) {
-                hipStream_t stream = pd.streams[s];
+            for (size_t s = 0; s < devices[d].streams.size(); ++s) {
+                size_t numFloats = devices[d].bufBytes / sizeof(float);
 
-                HIP_CHECK(hipMemcpyHtoDAsync(pd.d_inputs[s], pd.h_pinned_src[s], BYTES, stream));
+                HIP_CHECK(hipMemcpyHtoDAsync(devices[d].d_inputs[s],
+                                             devices[d].h_pinned_src[s],
+                                             devices[d].bufBytes,
+                                             devices[d].streams[s]));
 
-                int block = 256;
-                int grid = (ELEMENTS + block - 1) / block;
-                hipLaunchKernelGGL(add_kernel,
-                                   dim3(grid), dim3(block), 0, stream,
-                                   static_cast<float*>(pd.d_outputs[s]),
-                                   static_cast<float*>(pd.d_inputs[s]),
-                                   1.2345f, ELEMENTS);
+                dim3 block(256);
+                dim3 grid((numFloats + block.x - 1) / block.x);
+                hipLaunchKernelGGL(testKernel, grid, block, 0, devices[d].streams[s],
+                                   static_cast<float*>(devices[d].d_inputs[s]), numFloats);
 
-                HIP_CHECK(hipMemcpyDtoHAsync(pd.h_pinned_dst[s], pd.d_outputs[s], BYTES, stream));
+                HIP_CHECK(hipMemcpyDtoHAsync(devices[d].h_pinned_dst[s],
+                                             devices[d].d_inputs[s],
+                                             devices[d].bufBytes,
+                                             devices[d].streams[s]));
             }
         }
 
-        // synchronize all devices
-        for (auto &pd : devices) {
-            HIP_CHECK(hipSetDevice(pd.devId));
+        // Wait for all GPUs to finish
+        for (int d = 0; d < nDevices; d++) {
+            HIP_CHECK(hipSetDevice(devices[d].deviceId));
             HIP_CHECK(hipDeviceSynchronize());
         }
 
-        // print after all synchronizations
-        std::cout << "Iteration " << iteration++
+        std::cout << "Iteration " << iter++
                   << " done, devices=" << devices.size()
                   << ", streams/device=" << (devices.empty() ? 0 : devices[0].streams.size())
                   << ", hipMemcpyHtoDAsync() + hipLaunchKernelGGL() + hipMemcpyDtoHAsync() + hipDeviceSynchronize()" 
-                  << ", host copy_ops =" <<copy_ops.load() << std::endl;
+                  << std::endl;
     }
 
-    std::cout << "Stopping, cleaning up...\n";
-
-    for (auto &pd : devices) {
-        HIP_CHECK(hipSetDevice(pd.devId));
-        for (size_t s = 0; s < pd.streams.size(); ++s) {
-            HIP_CHECK(hipStreamDestroy(pd.streams[s]));
-            HIP_CHECK(hipFree(pd.d_inputs[s]));
-            HIP_CHECK(hipFree(pd.d_outputs[s]));
-            HIP_CHECK(hipHostFree(pd.h_pinned_src[s]));
-            HIP_CHECK(hipHostFree(pd.h_pinned_dst[s]));
-        }
-    }
-
-    g_stop.store(true);
-    for (auto &t : workers) if (t.joinable()) t.join();
-
-    std::cout << "All done.\n";
+    // Cleanup (unreachable in this infinite loop)
+    keepRunning = false;
+    for (auto& t : cpuThreads) t.join();
     return 0;
 }
