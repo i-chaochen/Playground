@@ -105,6 +105,8 @@ int main() {
     // === Main infinite loop ===
     size_t iter = 0;
     while (true) {
+        auto start = std::chrono::high_resolution_clock::now();
+
         for (int d = 0; d < usedDevices; d++) {
             HIP_CHECK(hipSetDevice(devices[d].deviceId));
 
@@ -134,10 +136,14 @@ int main() {
             HIP_CHECK(hipDeviceSynchronize());
         }
 
+        auto end = std::chrono::high_resolution_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
         std::cout << "Iteration " << iter++
                   << " done, devices=" << usedDevices
                   << ", StreamsPerDevice=" << streamsPerDevice
                   << ", hipMemcpyHtoDAsync() + hipLaunchKernelGGL() + hipMemcpyDtoHAsync() + hipDeviceSynchronize()" 
+                  << ", Time=" << elapsed_ms << " ms"
                   << std::endl;
     }
 
